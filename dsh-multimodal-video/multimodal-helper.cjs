@@ -320,6 +320,86 @@ function motionSegments(energies, duration, maxSegments) {
   return merged;
 }
 
+// Locate individual effect MOMENTS: local energy maxima inside the activity
+// segments, ranked globally and kept apart by >= minSeparation seconds. Each
+// peak is one "something just happened here" instant (a section entrance, a
+// hover flare, a burst start) — the natural zoom target.
+function findPeaks(energies, segments, minSeparation, maxPeaks) {
+  if (!energies.length || maxPeaks <= 0) return [];
+  const candidates = [];
+  for (const seg of segments) {
+    const idx = [];
+    for (let i = 0; i < energies.length; i += 1) {
+      const t = energies[i].t;
+      if (t >= seg.start && t <= seg.end) idx.push(i);
+    }
+    for (let a = 0; a < idx.length; a += 1) {
+      const i = idx[a];
+      const left = a > 0 ? energies[idx[a - 1]].e : -1;
+      const right = a < idx.length - 1 ? energies[idx[a + 1]].e : -1;
+      if (energies[i].e >= left && energies[i].e >= right) candidates.push({ t: energies[i].t, e: energies[i].e });
+    }
+  }
+  candidates.sort((a, b) => b.e - a.e);
+  const picked = [];
+  for (const c of candidates) {
+    if (picked.some((p) => Math.abs(p.t - c.t) < minSeparation)) continue;
+    picked.push(c);
+    if (picked.length >= maxPeaks) break;
+  }
+  picked.sort((a, b) => a.t - b.t);
+  return picked;
+}
+
+// Bounding box of the change around one instant: grab two small grayscale
+// frames straddling t, diff them, threshold adaptively, and map the box back
+// to source coordinates. Returns null when nothing conclusive (caller falls
+// back to full-frame extraction).
+async function motionBox(ffmpeg, videoPath, t, srcW, srcH) {
+  if (!(srcW > 0 && srcH > 0)) return null;
+  const w = 320;
+  const h = Math.max(2, 2 * Math.round((320 * srcH / srcW) / 2));
+  const grab = async (ts) => {
+    const out = await runTool(ffmpeg, ['-y', '-ss', Math.max(0, ts).toFixed(3), '-i', videoPath, '-frames:v', '1',
+      '-vf', 'scale=' + w + ':' + h + ',format=gray', '-f', 'rawvideo', '-'], 30000);
+    return Buffer.from(out.stdout).subarray(0, w * h);
+  };
+  try {
+    const a = await grab(t - 0.35);
+    const b = await grab(t + 0.35);
+    if (a.length === w * h && b.length === w * h) {
+      const diffs = new Float32Array(w * h);
+      let sum = 0;
+      for (let i = 0; i < w * h; i += 1) { const d = Math.abs(b[i] - a[i]); diffs[i] = d; sum += d; }
+      const mean = sum / (w * h);
+      const thr = Math.max(10, mean * 1.6);
+      let minX = w, minY = h, maxX = -1, maxY = -1, cnt = 0;
+      for (let y = 0; y < h; y += 1) {
+        for (let x = 0; x < w; x += 1) {
+          if (diffs[y * w + x] > thr) {
+            cnt += 1;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      if (cnt >= w * h * 0.004 && maxX > minX && maxY > minY) {
+        const sx = srcW / w, sy = srcH / h;
+        let x0 = minX * sx, x1 = (maxX + 1) * sx, y0 = minY * sy, y1 = (maxY + 1) * sy;
+        const mw = (x1 - x0) * 0.25 + 24, mh = (y1 - y0) * 0.25 + 24;
+        x0 = Math.max(0, x0 - mw); x1 = Math.min(srcW, x1 + mw);
+        y0 = Math.max(0, y0 - mh); y1 = Math.min(srcH, y1 + mh);
+        let bw = Math.round(x1 - x0), bh = Math.round(y1 - y0);
+        bw -= bw % 2; bh -= bh % 2;
+        if (bw >= 16 && bh >= 16) return { x: Math.round(x0), y: Math.round(y0), w: bw, h: bh };
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
 async function runVideo(req) {
   const ffmpeg = req.ffmpeg || 'ffmpeg';
   const ffprobe = req.ffprobe || 'ffprobe';
@@ -370,37 +450,67 @@ async function runVideo(req) {
     '-frames:v', '1', '-q:v', '4', diffPath], 180000);
 
   // 4. Motion-guided detail pass — the resolution carrier for effects and
-  // fine detail. Uniform sampling at 16 frames over a minute cannot see a
-  // 300ms transition at all; these frames can. Scan the activity signal,
-  // pick the most dynamic intervals, and pull high-resolution frames from
-  // inside each so the model watches every effect actually unfold.
+  // fine detail, in two levels:
+  //   a) anchors: one full frame at each activity region's midpoint, so the
+  //      zoom crops can be placed on the page;
+  //   b) zoom bursts: at the strongest motion PEAKS (individual effect
+  //      moments), a burst of frames at ~0.2s intervals CROPPED to the
+  //      moving region at original resolution — pixel-legible text and
+  //      sub-300ms evolution that neither uniform nor region-level sampling
+  //      can show.
   const detailSegmentsMax = Math.max(0, Math.min(8, Math.round(Number(req.detailSegments === undefined ? 4 : req.detailSegments))));
-  const detailFramesPerSeg = Math.max(2, Math.min(8, Math.round(Number(req.detailFrames) || 4)));
+  const detailFramesPerPeak = Math.max(2, Math.min(8, Math.round(Number(req.detailFrames) || 4)));
+  const detailPeaksMax = Math.max(0, Math.min(12, Math.round(Number(req.detailPeaks === undefined ? 5 : req.detailPeaks))));
   const detailWidth = Math.max(320, Math.min(1920, Math.round(Number(req.detailWidth) || 1280)));
-  const segments = [];
-  if (detailSegmentsMax > 0 && duration >= 2) {
-    segments.push(...motionSegments(await scanMotion(ffmpeg, videoPath, duration), duration, detailSegmentsMax));
-  }
+  const energies = (detailSegmentsMax > 0 || detailPeaksMax > 0) && duration >= 2
+    ? await scanMotion(ffmpeg, videoPath, duration)
+    : [];
+  const segments = detailSegmentsMax > 0 ? motionSegments(energies, duration, detailSegmentsMax) : [];
+  const peakScope = segments.length ? segments : [{ start: 0, end: duration }];
+  const peaks = detailPeaksMax > 0 ? findPeaks(energies, peakScope, 0.6, detailPeaksMax) : [];
+  // Frame budget: keep the whole pack (sheets + anchors + zooms + scenes)
+  // within what one vision call handles well.
+  while (peaks.length > 0 && 2 + segments.length + peaks.length * detailFramesPerPeak > 30) peaks.pop();
+  const stampSize = Math.max(22, Math.round(detailWidth / 40));
   const detailFiles = [];
+  // 4a. Region anchor frames.
   for (let s = 0; s < segments.length; s += 1) {
     const seg = segments[s];
-    const stamps = [];
-    for (let k = 0; k < detailFramesPerSeg; k += 1) {
-      const frac = detailFramesPerSeg === 1 ? 0.5 : k / (detailFramesPerSeg - 1);
-      stamps.push(seg.start + (seg.end - seg.start) * frac);
-    }
-    for (let k = 0; k < stamps.length; k += 1) {
-      const t = Math.max(0, Math.min(stamps[k], Math.max(0, duration - 0.05)));
-      const file = path.join(outDir, 'detail_s' + (s + 1) + '_f' + (k + 1) + '.jpg');
-      const stampText = 't=' + t.toFixed(2) + 's seg' + (s + 1) + '/' + segments.length + ' f' + (k + 1) + '/' + stamps.length;
+    const t = Math.max(0, Math.min((seg.start + seg.end) / 2, Math.max(0, duration - 0.05)));
+    const file = path.join(outDir, 'detail_a' + (s + 1) + '.jpg');
+    const stamp = font
+      ? "drawtext=fontfile='" + ffPath(font) + "':text='anchor t=" + t.toFixed(2) + "s':x=8:y=8:fontsize=" + stampSize + ":fontcolor=yellow:box=1:boxcolor=black@0.6"
+      : '';
+    try {
+      await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1',
+        '-vf', 'scale=min(iw\\,' + detailWidth + '):-2' + (stamp ? ',' + stamp : ''), '-q:v', '4', file], 60000);
+      detailFiles.push({ file: file, label: 'detail-anchor 片段 ' + (s + 1) + '/' + segments.length + '（' + seg.start.toFixed(2) + 's–' + seg.end.toFixed(2) + 's 运动区）全景锚点帧 t=' + t.toFixed(2) + 's（用于定位 zoom 放大帧在整页中的位置）' });
+    } catch (e) {}
+  }
+  // 4b. Peak zoom bursts: original-resolution crops around each effect
+  // moment, ~0.6s window spread across detailFramesPerPeak frames.
+  const step = detailFramesPerPeak > 1 ? 0.6 / (detailFramesPerPeak - 1) : 0;
+  for (let p = 0; p < peaks.length; p += 1) {
+    const peak = peaks[p];
+    const box = await motionBox(ffmpeg, videoPath, peak.t, width, height);
+    const baseW = box ? Math.min(box.w, 1600) : detailWidth;
+    const fs2 = Math.max(20, Math.round(baseW / 36));
+    for (let k = 0; k < detailFramesPerPeak; k += 1) {
+      const t = Math.max(0, Math.min(peak.t + (k - (detailFramesPerPeak - 1) / 2) * step, Math.max(0, duration - 0.05)));
+      const file = path.join(outDir, 'detail_p' + (p + 1) + '_f' + (k + 1) + '.jpg');
+      const stampText = 't=' + t.toFixed(2) + 's P' + (p + 1) + '/' + peaks.length + ' F' + (k + 1) + '/' + detailFramesPerPeak;
       const stamp = font
-        ? "drawtext=fontfile='" + ffPath(font) + "':text='" + stampText + "':x=8:y=8:fontsize=" + Math.max(22, Math.round(detailWidth / 40)) + ":fontcolor=yellow:box=1:boxcolor=black@0.6"
+        ? "drawtext=fontfile='" + ffPath(font) + "':text='" + stampText + "':x=6:y=6:fontsize=" + fs2 + ":fontcolor=yellow:box=1:boxcolor=black@0.6"
         : '';
+      const vf = (box ? 'crop=' + box.w + ':' + box.h + ':' + box.x + ':' + box.y + ',' : '')
+        + 'scale=min(iw\\,' + (box ? 1600 : detailWidth) + '):-2'
+        + (stamp ? ',' + stamp : '');
       try {
-        await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1',
-          '-vf', 'scale=min(iw\\,' + detailWidth + '):-2' + (stamp ? ',' + stamp : ''),
-          '-q:v', '4', file], 60000);
-        detailFiles.push({ file: file, label: 'detail 片段 ' + (s + 1) + '/' + segments.length + '（' + seg.start.toFixed(2) + 's–' + seg.end.toFixed(2) + 's 自动检测的运动密集区）第 ' + (k + 1) + '/' + stamps.length + ' 帧 t=' + t.toFixed(2) + 's 高清帧' });
+        await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1', '-vf', vf, '-q:v', '3', file], 60000);
+        detailFiles.push({
+          file: file,
+          label: 'detail-zoom 峰值 ' + (p + 1) + '/' + peaks.length + ' t=' + peak.t.toFixed(2) + 's 第 ' + (k + 1) + '/' + detailFramesPerPeak + ' 帧（运动峰值处' + (box ? '原始分辨率裁剪放大' : '全幅高清') + '，相邻帧间隔≈' + step.toFixed(2) + 's；文字/颜色/细节以此为准，帧间差异即效果演变过程）',
+        });
       } catch (e) {}
     }
   }
@@ -441,8 +551,9 @@ async function runVideo(req) {
   return {
     duration: duration, width: width, height: height, fps: fps,
     gridFrames: gridFrames, sceneCount: sceneCount,
-    detailSegments: segments.length, detailFrames: detailFiles.length,
+    detailSegments: segments.length, detailPeaks: peaks.length, detailFrames: detailFiles.length,
     segments: segments.map(function (s) { return { start: Number(s.start.toFixed(2)), end: Number(s.end.toFixed(2)) }; }),
+    peaks: peaks.map(function (p) { return Number(p.t.toFixed(2)); }),
     frames: frames,
   };
 }

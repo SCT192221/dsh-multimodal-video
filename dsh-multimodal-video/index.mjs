@@ -1043,8 +1043,9 @@ export function apply(ctx) {
         path: { type: 'string', description: '本地视频文件的绝对路径（mp4/mov/mkv/webm 等ffmpeg支持的格式）。' },
         prompt: { type: 'string', description: '想了解什么。省略时完整描述内容与动态过程。' },
         grid_frames: { type: 'integer', minimum: 4, maximum: 24, description: '接触图采样帧数，默认 16（超过30秒的视频自动升到24）。' },
-        detail_segments: { type: 'integer', minimum: 0, maximum: 8, description: '运动密集区放大片段数量，默认 4：自动检测变化最剧烈的时间段，每段高密度提取高清帧（默认每段4帧）。设 0 禁用。需要复刻特效细节时保持默认或调大。' },
-        detail_frames: { type: 'integer', minimum: 2, maximum: 8, description: '每个运动密集片段提取的高清帧数，默认 4。' },
+        detail_segments: { type: 'integer', minimum: 0, maximum: 8, description: '运动密集区数量，默认 4：自动检测变化最剧烈的时间段，每段提取一张全景锚点帧。设 0 禁用。' },
+        detail_peaks: { type: 'integer', minimum: 0, maximum: 12, description: '运动峰值放大数量，默认 5：定位变化最剧烈的瞬间，在每处以约0.2s间隔提取原始分辨率裁剪放大帧组（复刻特效的关键）。设 0 禁用。' },
+        detail_frames: { type: 'integer', minimum: 2, maximum: 8, description: '每个运动峰值提取的帧数，默认 4（覆盖峰值前后约0.6s）。' },
         scene_threshold: { type: 'number', minimum: 0.05, maximum: 0.9, description: '场景切换检测灵敏度，默认 0.3，越小越敏感。' },
         max_tokens: { type: 'integer', minimum: 1, maximum: 8192, description: '最大输出 token，默认 4096。' },
       },
@@ -1064,6 +1065,7 @@ export function apply(ctx) {
           frames_used: { type: 'integer' },
           scene_frames: { type: 'integer' },
           detail_segments: { type: 'integer' },
+          detail_peaks: { type: 'integer' },
           detail_frames: { type: 'integer' },
         },
         required: ['content', 'model'],
@@ -1073,7 +1075,8 @@ export function apply(ctx) {
         const blocks = [{ type: 'text', text: value?.content || '' }]
         if (value && typeof value.duration === 'number') {
           const dim = value.width && value.height ? `${value.width}×${value.height}@${Math.round(value.fps || 0)}fps` : '未知分辨率'
-          const detail = value.detail_segments ? `、运动密集区 ${value.detail_segments} 段高清放大帧 ${value.detail_frames || 0} 张` : ''
+          const detail = value.detail_segments || value.detail_peaks
+            ? `、运动密集区 ${value.detail_segments || 0} 段锚点帧 + 运动峰值 ${value.detail_peaks || 0} 处裁剪放大帧（共 ${value.detail_frames || 0} 张）` : ''
           blocks.push({ type: 'text', text: `（视频 ${dim}，时长 ${value.duration.toFixed(1)}s，送检 ${value.frames_used} 张增强帧，其中场景关键帧 ${value.scene_frames} 张${detail}）` })
         }
         return blocks
@@ -1112,6 +1115,7 @@ export function apply(ctx) {
         ...(ffprobePath ? { ffprobe: ffprobePath } : {}),
         ...(args.grid_frames !== undefined ? { gridFrames: args.grid_frames } : {}),
         ...(args.detail_segments !== undefined ? { detailSegments: args.detail_segments } : {}),
+        ...(args.detail_peaks !== undefined ? { detailPeaks: args.detail_peaks } : {}),
         ...(args.detail_frames !== undefined ? { detailFrames: args.detail_frames } : {}),
         ...(args.scene_threshold !== undefined ? { sceneThreshold: args.scene_threshold } : {}),
       }, exec?.signal)
@@ -1120,10 +1124,11 @@ export function apply(ctx) {
         '以下是同一个视频的增强帧包（按此说明解读）：',
         '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。同一对象在相邻格中的位置漂移即其运动轨迹。用于把握整体结构与时间线。',
         '2) diff-sheet：同一采样序列的相邻帧差分图：越亮表示该处变化越大（运动区域），暗部为静止背景。用于判断“什么在动、动得多强、往哪个方向”。',
-        '3) detail 高清帧（如有，重点）：系统自动检测了视频中运动/变化最剧烈的时间段，并在每段内高密度提取了全分辨率帧；左上角黄字 t= 为该帧精确时间戳，seg 为片段编号、f 为段内帧序。相邻两帧的时间戳差 = 该效果的真实演变时长；帧间的内容差异 = 效果的逐步变化过程。细读文字、颜色、布局请以这些帧为准。',
-        '4) scene 关键帧（如有）：场景切换瞬间的完整帧。',
+        '3) detail-anchor 全景锚点帧（如有）：每个自动检测的运动区中点的全幅帧，用于定位 zoom 放大帧在整页中的位置。',
+        '4) detail-zoom 峰值放大帧（如有，最重要）：系统定位了视频中变化最剧烈的瞬间（运动峰值），并在每个峰值前后以约 0.2s 间隔提取了原始分辨率裁剪放大帧（文字、颜色、边框等像素级细节以此为准）。同一峰值的相邻两帧：时间戳差 = 演变节奏，内容差异 = 效果的逐步变化过程。估算效果时长：若某峰值的 K 帧中前 j 帧仍在变化、其后稳定，则时长 ≈ j × 间隔。',
+        '5) scene 关键帧（如有）：场景切换瞬间的完整帧。',
         '请基于这些帧完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。',
-        '若用户要求复刻/实现/还原视频中的效果或界面：必须量化——用 detail 帧的时间戳差给出每个效果的持续时长（如 0.4s）；从相邻 detail 帧中对象的位置/尺寸/透明度变化推断运动方向与缓动类型（匀速、先快后慢=ease-out、先慢后快=ease-in、两端减速=ease-in-out）；精确描述颜色（说出近似色值）、布局位置（相对画面比例）与层次结构。静态帧读不出的运动信息务必结合 diff-sheet 与 detail 帧间变化推断，不要臆造。',
+        '若用户要求复刻/实现/还原视频中的效果或界面：必须量化——用 zoom 帧的时间戳与上述估算法给出每个效果的持续时长（精确到 0.1s 量级）；从相邻 zoom 帧中对象的位置/尺寸/透明度变化推断运动方向与缓动类型（匀速、先快后慢=ease-out、先慢后快=ease-in、两端减速=ease-in-out）；精确描述颜色（说出近似色值）、布局位置（相对画面比例）与层次结构。静态帧读不出的运动信息务必结合 diff-sheet 与 zoom 帧间变化推断，不要臆造。',
       ].join('\n')
       const prompt = `${guide}\n\n用户的分析请求：${args.prompt || '请完整描述这个视频的内容与动态过程。'}`
       const result = await runHelper({
@@ -1147,6 +1152,7 @@ export function apply(ctx) {
         frames_used: probe.frames.length,
         scene_frames: probe.sceneCount,
         detail_segments: probe.detailSegments || 0,
+        detail_peaks: probe.detailPeaks || 0,
         detail_frames: probe.detailFrames || 0,
       }
     },
