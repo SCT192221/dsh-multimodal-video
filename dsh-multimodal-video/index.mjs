@@ -1120,17 +1120,41 @@ export function apply(ctx) {
         ...(args.scene_threshold !== undefined ? { sceneThreshold: args.scene_threshold } : {}),
       }, exec?.signal)
       const images = probe.frames.map((frame) => ({ dataUrl: `data:${frame.mime};base64,${frame.base64}`, label: frame.label }))
+      // Numeric evidence from per-frame motion analysis (scroll separated
+      // from local effects). The model must treat these as measured ground
+      // truth — reading precise timings off stamped frames is far less
+      // reliable than handing over the numbers directly.
+      const evidenceLines = []
+      const ev = probe.evidence || { scroll: [], events: [] }
+      if (Array.isArray(ev.scroll) && ev.scroll.length > 0) {
+        evidenceLines.push('全局运动（整画面平移 = 页面滚动或镜头平移，本身不是动效）：')
+        for (const s of ev.scroll) {
+          const vert = Math.abs(s.vy) >= Math.abs(s.vx)
+          const move = vert ? (s.vy < 0 ? '内容整体向上平移（即向下滚动）' : '内容整体向下平移（即向上滚动）') : (s.vx < 0 ? '内容整体向左平移' : '内容整体向右平移')
+          evidenceLines.push(`- ${s.start}s–${s.end}s：${move}，速度约 ${s.pxPerSec}px/s`)
+        }
+      }
+      if (Array.isArray(ev.events) && ev.events.length > 0) {
+        evidenceLines.push('局部效果事件（已扣除全局运动后检测到的局部变化，即真正的动效/特效）：')
+        for (const e of ev.events) {
+          const region = e.cropped && e.x0 !== undefined ? `，区域 x ${e.x0}%–${e.x1}%、y ${e.y0}%–${e.y1}%（占画面比例）` : ''
+          evidenceLines.push(`- ${e.id}：t=${e.t}s，持续约 ${e.duration}s${region}`)
+        }
+      }
+      const evidenceText = evidenceLines.length > 0
+        ? `\n\n[运动数值证据]（由逐帧像素级运动分析计算，已分离全局滚动与局部变化；其中时间、时长、滚动速度均为测量值，必须采信，不要用目测推翻，更不要把整页滚动当成动效）\n${evidenceLines.join('\n')}`
+        : ''
       const guide = [
         '以下是同一个视频的增强帧包（按此说明解读）：',
-        '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。同一对象在相邻格中的位置漂移即其运动轨迹。用于把握整体结构与时间线。',
-        '2) diff-sheet：同一采样序列的相邻帧差分图：越亮表示该处变化越大（运动区域），暗部为静止背景。用于判断“什么在动、动得多强、往哪个方向”。',
-        '3) detail-anchor 全景锚点帧（如有）：每个自动检测的运动区中点的全幅帧，用于定位 zoom 放大帧在整页中的位置。',
-        '4) detail-zoom 峰值放大帧（如有，最重要）：系统定位了视频中变化最剧烈的瞬间（运动峰值），并在每个峰值前后以约 0.2s 间隔提取了原始分辨率裁剪放大帧（文字、颜色、边框等像素级细节以此为准）。同一峰值的相邻两帧：时间戳差 = 演变节奏，内容差异 = 效果的逐步变化过程。估算效果时长：若某峰值的 K 帧中前 j 帧仍在变化、其后稳定，则时长 ≈ j × 间隔。',
+        '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。用于把握整体结构与时间线。',
+        '2) diff-sheet：同一采样序列的相邻帧差分图（未扣滚动，整幅运动都会显现）：越亮表示该处变化越大。',
+        '3) detail-anchor 全景锚点帧（如有）：每个局部变化区中点的全幅帧，用于定位 zoom 放大帧在整页中的位置。',
+        '4) detail-zoom 事件放大帧（如有，最重要）：标着事件编号（E1、E2…）的帧组对应[运动数值证据]中的同名局部效果事件；已扣除页面滚动、区域锁定在效果发生处；每帧左上角 t= 为精确时间戳，相邻帧间隔标注在帧标签中；帧内容是事件区域的原始分辨率裁剪。文字、颜色、边框等像素级细节以此为准；效果的起止状态与中间演变从相邻帧差异读出；效果时长直接用证据中给出的持续时长，不要另行目测。',
         '5) scene 关键帧（如有）：场景切换瞬间的完整帧。',
-        '请基于这些帧完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。',
-        '若用户要求复刻/实现/还原视频中的效果或界面：必须量化——用 zoom 帧的时间戳与上述估算法给出每个效果的持续时长（精确到 0.1s 量级）；从相邻 zoom 帧中对象的位置/尺寸/透明度变化推断运动方向与缓动类型（匀速、先快后慢=ease-out、先慢后快=ease-in、两端减速=ease-in-out）；精确描述颜色（说出近似色值）、布局位置（相对画面比例）与层次结构。静态帧读不出的运动信息务必结合 diff-sheet 与 zoom 帧间变化推断，不要臆造。',
+        '请基于帧包与数值证据完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场/页面滚动（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。',
+        '若用户要求复刻/实现/还原视频中的效果或界面：必须量化——效果时长用证据中的事件持续时长；滚动用证据中的速度；从相邻 zoom 帧中对象的位置/尺寸/透明度变化推断缓动类型（匀速、先快后慢=ease-out、先慢后快=ease-in、两端减速=ease-in-out）；精确描述颜色（说出近似色值）、布局位置（相对画面比例）与层次结构。静态帧读不出的运动信息务必结合 diff-sheet 与 zoom 帧间变化推断，不要臆造。',
       ].join('\n')
-      const prompt = `${guide}\n\n用户的分析请求：${args.prompt || '请完整描述这个视频的内容与动态过程。'}`
+      const prompt = `${guide}${evidenceText}\n\n用户的分析请求：${args.prompt || '请完整描述这个视频的内容与动态过程。'}`
       const result = await runHelper({
         kind: 'vision',
         apiKey,

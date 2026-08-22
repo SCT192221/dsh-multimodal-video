@@ -256,30 +256,208 @@ async function probeVideo(ffmpeg, ffprobe, videoPath) {
   return { duration: 0, width: 0, height: 0, fps: 0 };
 }
 
-// Motion-energy scan: decode tiny grayscale frames at a fixed scan rate and
-// measure the mean absolute difference between consecutive scan frames.
-// The resulting activity signal tells us WHEN the video actually changes —
-// uniform sampling cannot, which is exactly how fast UI transitions and
-// effect bursts fall between sample points. Capped at 15 minutes of scan
-// so rawvideo output stays within the exec buffer.
-async function scanMotion(ffmpeg, videoPath, duration) {
-  const scanFps = 4, w = 64, h = 36, frameBytes = w * h;
-  const capSeconds = Math.min(duration || 900, 900);
+// Global (camera) motion between two same-size grayscale buffers via
+// two-stage full-search block matching: coarse pass on a 2x-decimated grid,
+// then a fine pass around the doubled coarse estimate. Returns the best
+// integer (dx, dy) in buffer pixels — the displacement content underwent
+// between the two frames — plus the mean residual after compensation.
+// For screen recordings this is the scroll vector; for camera footage it is
+// the pan/tilt. Without separating it out, scroll dominates every motion
+// signal and effects drown in it.
+function estimateGlobalMotion(a, b, w, h) {
+  // Motion penalty: among alignments with similar SAD (periodic content —
+  // striped test patterns, text line rows — yields many near-equal
+  // minima), prefer the SMALLEST displacement. Without it the estimator
+  // locks onto a wrong period multiple.
+  const PENALTY = 0.3;
+  const sad = function (A, B, W, H, dx, dy) {
+    const x0 = Math.max(0, -dx), x1 = Math.min(W, W - dx);
+    const y0 = Math.max(0, -dy), y1 = Math.min(H, H - dy);
+    if (x1 <= x0 || y1 <= y0) return Number.MAX_SAFE_INTEGER;
+    let s = 0;
+    for (let y = y0; y < y1; y += 1) {
+      const ra = y * W, rb = (y + dy) * W + dx;
+      for (let x = x0; x < x1; x += 1) s += Math.abs(B[rb + x] - A[ra + x]);
+    }
+    return s / ((x1 - x0) * (y1 - y0)) + PENALTY * (Math.abs(dx) + Math.abs(dy));
+  };
+  const dw = Math.floor(w / 2), dh = Math.floor(h / 2);
+  const da = new Uint8Array(dw * dh), db = new Uint8Array(dw * dh);
+  for (let y = 0; y < dh; y += 1) {
+    for (let x = 0; x < dw; x += 1) {
+      da[y * dw + x] = a[(2 * y) * w + 2 * x];
+      db[y * dw + x] = b[(2 * y) * w + 2 * x];
+    }
+  }
+  let coarse = { dx: 0, dy: 0, e: sad(da, db, dw, dh, 0, 0) };
+  for (let dy = -6; dy <= 6; dy += 1) {
+    for (let dx = -6; dx <= 6; dx += 1) {
+      const e = sad(da, db, dw, dh, dx, dy);
+      if (e < coarse.e) coarse = { dx: dx, dy: dy, e: e };
+    }
+  }
+  let best = { dx: coarse.dx * 2, dy: coarse.dy * 2, e: sad(a, b, w, h, coarse.dx * 2, coarse.dy * 2) };
+  for (let dy = -2; dy <= 2; dy += 1) {
+    for (let dx = -2; dx <= 2; dx += 1) {
+      const cx = coarse.dx * 2 + dx, cy = coarse.dy * 2 + dy;
+      const e = sad(a, b, w, h, cx, cy);
+      if (e < best.e) best = { dx: cx, dy: cy, e: e };
+    }
+  }
+  // Half-pel refinement: bilinear-interpolated candidates around the integer
+  // minimum. Sub-pixel velocities (e.g. 6.25px/interval) otherwise make the
+  // integer estimate flutter ±1 between intervals, imprinting phantom
+  // residuals on the compensated signal.
+  const sadHalf = function (fdx, fdy) {
+    const dx0 = Math.floor(fdx), dy0 = Math.floor(fdy);
+    const fx = fdx - dx0, fy = fdy - dy0;
+    const x0 = Math.max(0, -dx0), x1 = Math.min(w - 1, w - 1 - dx0);
+    const y0 = Math.max(0, -dy0), y1 = Math.min(h - 1, h - 1 - dy0);
+    if (x1 <= x0 || y1 <= y0) return Number.MAX_SAFE_INTEGER;
+    let s = 0;
+    for (let y = y0; y < y1; y += 1) {
+      const ra = y * w + x0;
+      const rb = (y + dy0) * w + dx0 + x0;
+      for (let x = 0; x < x1 - x0; x += 1) {
+        const p00 = b[rb + x], p10 = b[rb + x + 1];
+        const p01 = b[rb + w + x], p11 = b[rb + w + x + 1];
+        const top = p00 + (p10 - p00) * fx;
+        const bot = p01 + (p11 - p01) * fx;
+        s += Math.abs(top + (bot - top) * fy - a[ra + x]);
+      }
+    }
+    return s / ((x1 - x0) * (y1 - y0)) + PENALTY * 0.5 * (Math.abs(fdx) + Math.abs(fdy));
+  };
+  let fine = { dx: best.dx, dy: best.dy, e: sadHalf(best.dx, best.dy) };
+  for (let sdy = -1; sdy <= 1; sdy += 1) {
+    for (let sdx = -1; sdx <= 1; sdx += 1) {
+      if (!sdx && !sdy) continue;
+      const fdx = best.dx + sdx * 0.5, fdy = best.dy + sdy * 0.5;
+      const e = sadHalf(fdx, fdy);
+      if (e < fine.e) fine = { dx: fdx, dy: fdy, e: e };
+    }
+  }
+  // Report the UN-penalized residual for downstream thresholds.
+  const plainHalf = function (fdx, fdy) {
+    const dx0 = Math.floor(fdx), dy0 = Math.floor(fdy);
+    const fx = fdx - dx0, fy = fdy - dy0;
+    const x0 = Math.max(0, -dx0), x1 = Math.min(w - 1, w - 1 - dx0);
+    const y0 = Math.max(0, -dy0), y1 = Math.min(h - 1, h - 1 - dy0);
+    if (x1 <= x0 || y1 <= y0) return Number.MAX_SAFE_INTEGER;
+    let s = 0;
+    for (let y = y0; y < y1; y += 1) {
+      const ra = y * w + x0;
+      const rb = (y + dy0) * w + dx0 + x0;
+      for (let x = 0; x < x1 - x0; x += 1) {
+        const p00 = b[rb + x], p10 = b[rb + x + 1];
+        const p01 = b[rb + w + x], p11 = b[rb + w + x + 1];
+        const top = p00 + (p10 - p00) * fx;
+        const bot = p01 + (p11 - p01) * fx;
+        s += Math.abs(top + (bot - top) * fy - a[ra + x]);
+      }
+    }
+    return s / ((x1 - x0) * (y1 - y0));
+  };
+  return { dx: fine.dx, dy: fine.dy, residual: plainHalf(fine.dx, fine.dy) };
+}
+
+// Motion scan with global-motion separation. Decodes 160x90 grayscale
+// frames at 4fps and, for each consecutive pair, computes:
+//   raw      — mean |diff| (all change, scroll included)
+//   residual — mean |diff| AFTER compensating the estimated global motion
+//              (local change only: the actual effects)
+//   gx, gy   — global displacement in SOURCE pixels over the interval
+// Cap 240s so the rawvideo pipe stays under the exec buffer.
+async function scanMotion(ffmpeg, videoPath, duration, srcW, srcH) {
+  const scanFps = 4, w = 160, h = 90, frameBytes = w * h;
+  const capSeconds = Math.min(duration || 240, 240);
   try {
     const out = await runTool(ffmpeg, ['-t', String(capSeconds), '-i', videoPath, '-vf', 'fps=' + scanFps + ',scale=' + w + ':' + h + ',format=gray', '-f', 'rawvideo', '-'], 120000);
     const buf = Buffer.from(out.stdout);
     const n = Math.floor(buf.length / frameBytes);
     if (n < 4) return [];
+    const scaleX = srcW > 0 ? srcW / w : 1;
+    const scaleY = srcH > 0 ? srcH / h : 1;
     const energies = [];
     for (let i = 1; i < n; i += 1) {
       const a = buf.subarray((i - 1) * frameBytes, i * frameBytes);
       const b = buf.subarray(i * frameBytes, (i + 1) * frameBytes);
       let sum = 0;
       for (let j = 0; j < frameBytes; j += 1) sum += Math.abs(b[j] - a[j]);
-      energies.push({ t: (i + 0.5) / scanFps, e: sum / frameBytes });
+      const g = estimateGlobalMotion(a, b, w, h);
+      energies.push({
+        t: (i + 0.5) / scanFps,
+        raw: sum / frameBytes,
+        residual: g.residual,
+        gx: g.dx * scaleX,
+        gy: g.dy * scaleY,
+      });
     }
     return energies;
   } catch (e) { return []; }
+}
+
+// Group scan intervals whose global motion is significant into scroll/pan
+// periods with average source-scale velocity.
+function scrollPeriods(energies) {
+  const runs = [];
+  let cur = null;
+  let gap = 0;
+  for (const e of energies) {
+    const vx = e.gx * 4, vy = e.gy * 4; // source px per second
+    if (Math.hypot(vx, vy) > 45) {
+      if (!cur) { cur = { from: e.t - 0.125, to: e.t + 0.125, sx: 0, sy: 0, n: 0 }; runs.push(cur); }
+      cur.to = e.t + 0.125;
+      cur.sx += vx; cur.sy += vy; cur.n += 1;
+      gap = 0;
+    } else if (cur) {
+      // Tolerate one sub-threshold sample (velocity quantization can dip
+      // a single interval during continuous scroll).
+      gap += 1;
+      if (gap >= 2) cur = null;
+    }
+  }
+  return runs.filter((r) => r.to - r.from >= 0.4).map((r) => {
+    const vx = r.sx / r.n, vy = r.sy / r.n;
+    return {
+      start: Number(r.from.toFixed(2)), end: Number(r.to.toFixed(2)),
+      vx: Math.round(vx), vy: Math.round(vy),
+      pxPerSec: Math.round(Math.hypot(vx, vy)),
+    };
+  });
+}
+
+// Net content displacement (source px) between two timestamps, from the
+// scan's global vectors — used to keep a page-fixed region pinned in frame
+// coordinates while the page scrolls. Median-of-intervals × count instead
+// of a raw sum: sub-pixel velocities make the integer scan estimates
+// flutter ±1 px per interval, and summing amplifies that flutter.
+function displacementBetween(energies, t0, t1) {
+  const xs = [], ys = [];
+  for (const e of energies) {
+    if (e.t > t0 && e.t <= t1) { xs.push(e.gx); ys.push(e.gy); }
+  }
+  if (!xs.length) return { dx: 0, dy: 0 };
+  xs.sort((a, b) => a - b);
+  ys.sort((a, b) => a - b);
+  const mx = xs[Math.floor(xs.length / 2)], my = ys[Math.floor(ys.length / 2)];
+  return { dx: mx * xs.length, dy: my * xs.length };
+}
+
+// Event duration from the residual signal: the contiguous span around the
+// peak where residual stays above a fraction of the peak value.
+function eventDuration(signal, t) {
+  if (!signal.length) return 0;
+  let idx = 0, bestD = Infinity;
+  for (let i = 0; i < signal.length; i += 1) {
+    const d = Math.abs(signal[i].t - t);
+    if (d < bestD) { bestD = d; idx = i; }
+  }
+  const thr = Math.max(0.8, signal[idx].e * 0.25);
+  let lo = idx, hi = idx;
+  while (lo > 0 && signal[lo - 1].e > thr) lo -= 1;
+  while (hi < signal.length - 1 && signal[hi + 1].e > thr) hi += 1;
+  return Math.max(0.1, Math.min(3, signal[hi].t - signal[lo].t + 0.25));
 }
 
 // Turn the activity signal into at most `maxSegments` time ranges: threshold
@@ -326,6 +504,11 @@ function motionSegments(energies, duration, maxSegments) {
 // hover flare, a burst start) — the natural zoom target.
 function findPeaks(energies, segments, minSeparation, maxPeaks) {
   if (!energies.length || maxPeaks <= 0) return [];
+  // Absolute floor only: half-pel estimation keeps the compensated noise
+  // floor low (~1-2), so anything above 2.5 is real change. A
+  // median-relative threshold would reject uniformly-moving content (a
+  // constant-motion video has its own motion as the median).
+  const thr = 2.5;
   const candidates = [];
   for (const seg of segments) {
     const idx = [];
@@ -337,7 +520,7 @@ function findPeaks(energies, segments, minSeparation, maxPeaks) {
       const i = idx[a];
       const left = a > 0 ? energies[idx[a - 1]].e : -1;
       const right = a < idx.length - 1 ? energies[idx[a + 1]].e : -1;
-      if (energies[i].e >= left && energies[i].e >= right) candidates.push({ t: energies[i].t, e: energies[i].e });
+      if (energies[i].e >= left && energies[i].e >= right && energies[i].e > thr) candidates.push({ t: energies[i].t, e: energies[i].e });
     }
   }
   candidates.sort((a, b) => b.e - a.e);
@@ -351,11 +534,14 @@ function findPeaks(energies, segments, minSeparation, maxPeaks) {
   return picked;
 }
 
-// Bounding box of the change around one instant: grab two small grayscale
-// frames straddling t, diff them, threshold adaptively, and map the box back
-// to source coordinates. Returns null when nothing conclusive (caller falls
-// back to full-frame extraction).
-async function motionBox(ffmpeg, videoPath, t, srcW, srcH) {
+// Bounding box of the LOCAL change around one instant, with global motion
+// compensated: grab two grayscale frames straddling t, align the later one
+// by the estimated global displacement (initial guess from the scan, refined
+// locally), then threshold the residual diff. Without compensation a
+// scrolling page diffs across the entire frame and every "effect box" is
+// the full screen. Returns { box, strength } in source coordinates, or null
+// when nothing conclusive (caller falls back to full-frame extraction).
+async function motionBox(ffmpeg, videoPath, t, srcW, srcH, guess) {
   if (!(srcW > 0 && srcH > 0)) return null;
   const w = 320;
   const h = Math.max(2, 2 * Math.round((320 * srcH / srcW) / 2));
@@ -368,32 +554,118 @@ async function motionBox(ffmpeg, videoPath, t, srcW, srcH) {
     const a = await grab(t - 0.35);
     const b = await grab(t + 0.35);
     if (a.length === w * h && b.length === w * h) {
-      const diffs = new Float32Array(w * h);
-      let sum = 0;
-      for (let i = 0; i < w * h; i += 1) { const d = Math.abs(b[i] - a[i]); diffs[i] = d; sum += d; }
-      const mean = sum / (w * h);
-      const thr = Math.max(10, mean * 1.6);
-      let minX = w, minY = h, maxX = -1, maxY = -1, cnt = 0;
+      // Sub-pixel alignment: start from the scan-derived displacement (now
+      // half-pel accurate), refine on an integer grid, then half-pel again.
+      // Bilinear sampling lets the final compensation sit at fractional
+      // offsets, which integer-only alignment cannot represent.
+      const cdx = (guess ? guess.dx : 0) * w / srcW;
+      const cdy = (guess ? guess.dy : 0) * h / srcH;
+      const gdx = Math.round(cdx), gdy = Math.round(cdy);
+      const PENALTY = 0.3; // prefer smallest displacement among near-equal SADs
+      const sad = (dx, dy) => {
+        const x0 = Math.max(0, -dx), x1 = Math.min(w, w - dx);
+        const y0 = Math.max(0, -dy), y1 = Math.min(h, h - dy);
+        if (x1 <= x0 || y1 <= y0) return Number.MAX_SAFE_INTEGER;
+        let s = 0;
+        for (let y = y0; y < y1; y += 1) {
+          const ra = y * w, rb = (y + dy) * w + dx;
+          for (let x = x0; x < x1; x += 1) s += Math.abs(b[rb + x] - a[ra + x]);
+        }
+        return s / ((x1 - x0) * (y1 - y0)) + PENALTY * (Math.abs(dx) + Math.abs(dy));
+      };
+      let bd = { dx: gdx, dy: gdy, e: sad(gdx, gdy) };
+      for (let dy = -8; dy <= 8; dy += 1) {
+        for (let dx = -8; dx <= 8; dx += 1) {
+          const e = sad(gdx + dx, gdy + dy);
+          if (e < bd.e) bd = { dx: gdx + dx, dy: gdy + dy, e: e };
+        }
+      }
+      // Half-pel pass around the integer optimum (bilinear SAD).
+      const sadHalf = (fdx, fdy) => {
+        const dx0 = Math.floor(fdx), dy0 = Math.floor(fdy);
+        const fx = fdx - dx0, fy = fdy - dy0;
+        const x0 = Math.max(0, -dx0), x1 = Math.min(w - 1, w - 1 - dx0);
+        const y0 = Math.max(0, -dy0), y1 = Math.min(h - 1, h - 1 - dy0);
+        if (x1 <= x0 || y1 <= y0) return Number.MAX_SAFE_INTEGER;
+        let s = 0;
+        for (let y = y0; y < y1; y += 1) {
+          const ra = y * w + x0;
+          const rb = (y + dy0) * w + dx0 + x0;
+          for (let x = 0; x < x1 - x0; x += 1) {
+            const p00 = b[rb + x], p10 = b[rb + x + 1];
+            const p01 = b[rb + w + x], p11 = b[rb + w + x + 1];
+            const top = p00 + (p10 - p00) * fx;
+            const bot = p01 + (p11 - p01) * fx;
+            s += Math.abs(top + (bot - top) * fy - a[ra + x]);
+          }
+        }
+        return s / ((x1 - x0) * (y1 - y0)) + PENALTY * 0.5 * (Math.abs(fdx) + Math.abs(fdy));
+      };
+      let fd = { dx: bd.dx, dy: bd.dy };
+      let fde = sadHalf(bd.dx, bd.dy);
+      for (let sdy = -1; sdy <= 1; sdy += 1) {
+        for (let sdx = -1; sdx <= 1; sdx += 1) {
+          if (!sdx && !sdy) continue;
+          const e = sadHalf(bd.dx + sdx * 0.5, bd.dy + sdy * 0.5);
+          if (e < fde) { fde = e; fd = { dx: bd.dx + sdx * 0.5, dy: bd.dy + sdy * 0.5 }; }
+        }
+      }
+      // Bilinear sampler for b at fractional coordinates.
+      const sample = (x, y) => {
+        if (x < 0 || x > w - 1.001 || y < 0 || y > h - 1.001) return -1;
+        const xi = Math.floor(x), yi = Math.floor(y);
+        const fx = x - xi, fy = y - yi;
+        const p00 = b[yi * w + xi], p10 = b[yi * w + xi + 1];
+        const p01 = b[(yi + 1) * w + xi], p11 = b[(yi + 1) * w + xi + 1];
+        return p00 + (p10 - p00) * fx + (p01 - p00 + (p11 - p10 - p01 + p00) * fx) * fy;
+      };
+      // Residual diff: later frame COMPENSATED onto the earlier one at the
+      // sub-pel offset, aggregated into 8x8-block means. Block aggregation
+      // is essential: per-pixel thresholds cannot separate a dense effect
+      // region from scattered interpolation noise, and the bounding box
+      // then spans the whole frame.
+      const bs = 8;
+      const gw = Math.floor(w / bs), gh = Math.floor(h / bs);
+      const block = new Float32Array(gw * gh);
+      const bcnt = new Uint32Array(gw * gh);
       for (let y = 0; y < h; y += 1) {
         for (let x = 0; x < w; x += 1) {
-          if (diffs[y * w + x] > thr) {
+          const v = sample(x + fd.dx, y + fd.dy);
+          if (v < 0) continue;
+          const bi = Math.floor(y / bs) * gw + Math.floor(x / bs);
+          block[bi] += Math.abs(v - a[y * w + x]);
+          bcnt[bi] += 1;
+        }
+      }
+      let bsum = 0, bn = 0;
+      for (let i = 0; i < block.length; i += 1) {
+        if (bcnt[i]) { block[i] /= bcnt[i]; bsum += block[i]; bn += 1; }
+      }
+      const bmean = bn ? bsum / bn : 0;
+      const bthr = Math.max(8, bmean * 2.2);
+      let minX = gw, minY = gh, maxX = -1, maxY = -1, cnt = 0;
+      for (let by = 0; by < gh; by += 1) {
+        for (let bx = 0; bx < gw; bx += 1) {
+          const i = by * gw + bx;
+          if (bcnt[i] && block[i] > bthr) {
             cnt += 1;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+            if (bx < minX) minX = bx;
+            if (bx > maxX) maxX = bx;
+            if (by < minY) minY = by;
+            if (by > maxY) maxY = by;
           }
         }
       }
-      if (cnt >= w * h * 0.004 && maxX > minX && maxY > minY) {
+      if (cnt >= 2 && maxX >= minX && maxY >= minY) {
         const sx = srcW / w, sy = srcH / h;
-        let x0 = minX * sx, x1 = (maxX + 1) * sx, y0 = minY * sy, y1 = (maxY + 1) * sy;
+        let x0 = minX * bs * sx, x1 = (maxX + 1) * bs * sx;
+        let y0 = minY * bs * sy, y1 = (maxY + 1) * bs * sy;
         const mw = (x1 - x0) * 0.25 + 24, mh = (y1 - y0) * 0.25 + 24;
         x0 = Math.max(0, x0 - mw); x1 = Math.min(srcW, x1 + mw);
         y0 = Math.max(0, y0 - mh); y1 = Math.min(srcH, y1 + mh);
         let bw = Math.round(x1 - x0), bh = Math.round(y1 - y0);
         bw -= bw % 2; bh -= bh % 2;
-        if (bw >= 16 && bh >= 16) return { x: Math.round(x0), y: Math.round(y0), w: bw, h: bh };
+        if (bw >= 16 && bh >= 16) return { box: { x: Math.round(x0), y: Math.round(y0), w: bw, h: bh }, strength: bmean };
       }
     }
   } catch (e) {}
@@ -449,28 +721,35 @@ async function runVideo(req) {
     'fps=' + rate + ',tblend=all_mode=difference,eq=contrast=3.5' + (tsFilter ? ',' + tsFilter : '') + ',scale=' + cell + ':-2,tile=' + cols + 'x' + rows,
     '-frames:v', '1', '-q:v', '4', diffPath], 180000);
 
-  // 4. Motion-guided detail pass — the resolution carrier for effects and
-  // fine detail, in two levels:
-  //   a) anchors: one full frame at each activity region's midpoint, so the
-  //      zoom crops can be placed on the page;
-  //   b) zoom bursts: at the strongest motion PEAKS (individual effect
-  //      moments), a burst of frames at ~0.2s intervals CROPPED to the
-  //      moving region at original resolution — pixel-legible text and
-  //      sub-300ms evolution that neither uniform nor region-level sampling
-  //      can show.
+  // 4. Motion-guided detail pass with global-motion compensation — the
+  // resolution carrier for effects and fine detail. The scan separates
+  // global motion (scroll/pan) from local change (effects); segments, peaks
+  // and crop boxes all operate on the COMPENSATED residual so scroll cannot
+  // masquerade as an effect, and crops track the page-fixed region across
+  // scroll via the measured displacement:
+  //   a) anchors: one full frame per local-change region midpoint;
+  //   b) zoom bursts: at residual peaks (effect moments), original-resolution
+  //      crops at ~0.2s intervals, each box shifted by the scroll
+  //      displacement so it stays pinned to the effect region.
   const detailSegmentsMax = Math.max(0, Math.min(8, Math.round(Number(req.detailSegments === undefined ? 4 : req.detailSegments))));
   const detailFramesPerPeak = Math.max(2, Math.min(8, Math.round(Number(req.detailFrames) || 4)));
   const detailPeaksMax = Math.max(0, Math.min(12, Math.round(Number(req.detailPeaks === undefined ? 5 : req.detailPeaks))));
   const detailWidth = Math.max(320, Math.min(1920, Math.round(Number(req.detailWidth) || 1280)));
   const energies = (detailSegmentsMax > 0 || detailPeaksMax > 0) && duration >= 2
-    ? await scanMotion(ffmpeg, videoPath, duration)
+    ? await scanMotion(ffmpeg, videoPath, duration, width, height)
     : [];
-  const segments = detailSegmentsMax > 0 ? motionSegments(energies, duration, detailSegmentsMax) : [];
+  // Half-pel motion estimation keeps the compensated residual clean enough
+  // that no signal smoothing is needed — and smoothing would erase
+  // single-interval (0.25s) effect events like appear/disappear.
+  const residualSignal = energies.map(function (e) { return { t: e.t, e: e.residual }; })
+  const segments = detailSegmentsMax > 0 ? motionSegments(residualSignal, duration, detailSegmentsMax) : [];
   const peakScope = segments.length ? segments : [{ start: 0, end: duration }];
-  const peaks = detailPeaksMax > 0 ? findPeaks(energies, peakScope, 0.6, detailPeaksMax) : [];
+  const peaks = detailPeaksMax > 0 ? findPeaks(residualSignal, peakScope, 0.6, detailPeaksMax) : [];
   // Frame budget: keep the whole pack (sheets + anchors + zooms + scenes)
   // within what one vision call handles well.
   while (peaks.length > 0 && 2 + segments.length + peaks.length * detailFramesPerPeak > 30) peaks.pop();
+  const scroll = scrollPeriods(energies);
+  const events = [];
   const stampSize = Math.max(22, Math.round(detailWidth / 40));
   const detailFiles = [];
   // 4a. Region anchor frames.
@@ -484,39 +763,69 @@ async function runVideo(req) {
     try {
       await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1',
         '-vf', 'scale=min(iw\\,' + detailWidth + '):-2' + (stamp ? ',' + stamp : ''), '-q:v', '4', file], 60000);
-      detailFiles.push({ file: file, label: 'detail-anchor 片段 ' + (s + 1) + '/' + segments.length + '（' + seg.start.toFixed(2) + 's–' + seg.end.toFixed(2) + 's 运动区）全景锚点帧 t=' + t.toFixed(2) + 's（用于定位 zoom 放大帧在整页中的位置）' });
+      detailFiles.push({ file: file, label: 'detail-anchor 局部变化区 ' + (s + 1) + '/' + segments.length + '（' + seg.start.toFixed(2) + 's–' + seg.end.toFixed(2) + 's）全景锚点帧 t=' + t.toFixed(2) + 's（用于定位 zoom 放大帧在整页中的位置）' });
     } catch (e) {}
   }
-  // 4b. Peak zoom bursts: original-resolution crops around each effect
-  // moment, ~0.6s window spread across detailFramesPerPeak frames.
+  // 4b. Peak zoom bursts: compensated crops pinned to the effect region.
   const step = detailFramesPerPeak > 1 ? 0.6 / (detailFramesPerPeak - 1) : 0;
   for (let p = 0; p < peaks.length; p += 1) {
     const peak = peaks[p];
-    const box = await motionBox(ffmpeg, videoPath, peak.t, width, height);
+    const guess = displacementBetween(energies, peak.t - 0.35, peak.t + 0.35);
+    const mb = await motionBox(ffmpeg, videoPath, peak.t, width, height, guess);
+    const box = mb ? mb.box : null;
+    const evDuration = eventDuration(residualSignal, peak.t);
+    const ev = {
+      id: 'E' + (p + 1),
+      t: Number(peak.t.toFixed(2)),
+      duration: Number(evDuration.toFixed(2)),
+    };
+    if (box && width > 0 && height > 0) {
+      ev.x0 = Math.round(box.x / width * 100);
+      ev.x1 = Math.round((box.x + box.w) / width * 100);
+      ev.y0 = Math.round(box.y / height * 100);
+      ev.y1 = Math.round((box.y + box.h) / height * 100);
+      ev.cropped = true;
+    } else ev.cropped = false;
+    events.push(ev);
     const baseW = box ? Math.min(box.w, 1600) : detailWidth;
     const fs2 = Math.max(20, Math.round(baseW / 36));
     for (let k = 0; k < detailFramesPerPeak; k += 1) {
       const t = Math.max(0, Math.min(peak.t + (k - (detailFramesPerPeak - 1) / 2) * step, Math.max(0, duration - 0.05)));
+      // Keep the crop pinned to the page-fixed effect region: shift the box
+      // by the scroll displacement accumulated since the reference frame.
+      let vf = '';
+      if (box) {
+        const shift = displacementBetween(energies, peak.t - 0.35, t);
+        let cx = Math.round(Math.min(Math.max(box.x + shift.dx, 0), Math.max(0, width - box.w)));
+        let cy = Math.round(Math.min(Math.max(box.y + shift.dy, 0), Math.max(0, height - box.h)));
+        let cw = Math.min(box.w, Math.max(16, width - cx));
+        let ch = Math.min(box.h, Math.max(16, height - cy));
+        cw -= cw % 2; ch -= ch % 2;
+        vf = 'crop=' + cw + ':' + ch + ':' + cx + ':' + cy + ',scale=min(iw\\,1600):-2';
+      } else {
+        vf = 'scale=min(iw\\,' + detailWidth + '):-2';
+      }
       const file = path.join(outDir, 'detail_p' + (p + 1) + '_f' + (k + 1) + '.jpg');
-      const stampText = 't=' + t.toFixed(2) + 's P' + (p + 1) + '/' + peaks.length + ' F' + (k + 1) + '/' + detailFramesPerPeak;
+      const stampText = 't=' + t.toFixed(2) + 's ' + ev.id + ' F' + (k + 1) + '/' + detailFramesPerPeak;
       const stamp = font
         ? "drawtext=fontfile='" + ffPath(font) + "':text='" + stampText + "':x=6:y=6:fontsize=" + fs2 + ":fontcolor=yellow:box=1:boxcolor=black@0.6"
         : '';
-      const vf = (box ? 'crop=' + box.w + ':' + box.h + ':' + box.x + ':' + box.y + ',' : '')
-        + 'scale=min(iw\\,' + (box ? 1600 : detailWidth) + '):-2'
-        + (stamp ? ',' + stamp : '');
       try {
-        await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1', '-vf', vf, '-q:v', '3', file], 60000);
+        await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1', '-vf', vf + (stamp ? ',' + stamp : ''), '-q:v', '3', file], 60000);
         detailFiles.push({
           file: file,
-          label: 'detail-zoom 峰值 ' + (p + 1) + '/' + peaks.length + ' t=' + peak.t.toFixed(2) + 's 第 ' + (k + 1) + '/' + detailFramesPerPeak + ' 帧（运动峰值处' + (box ? '原始分辨率裁剪放大' : '全幅高清') + '，相邻帧间隔≈' + step.toFixed(2) + 's；文字/颜色/细节以此为准，帧间差异即效果演变过程）',
+          label: 'detail-zoom 事件' + ev.id + ' t=' + peak.t.toFixed(2) + 's 第 ' + (k + 1) + '/' + detailFramesPerPeak + ' 帧（已扣除页面滚动、锁定效果区域的原始分辨率裁剪放大，相邻帧间隔≈' + step.toFixed(2) + 's；文字/颜色/细节以此为准，帧间差异即效果演变过程；该事件持续约' + evDuration.toFixed(2) + 's，见数值证据）',
         });
       } catch (e) {}
     }
   }
 
   // 5. Scene-change frames at full-ish resolution. A single-shot video
-  // legitimately yields zero of these — never fatal.
+  // legitimately yields zero of these — never fatal. Scroll noise can trip
+  // the scene detector, so frames inside detected GLOBAL-MOTION periods are
+  // excluded unless they also coincide with a local event (the effect
+  // moments are already covered by zoom bursts; scene frames here are for
+  // hard content cuts).
   const sceneDir = path.join(outDir, 'scenes');
   const sceneThreshold = Math.min(0.9, Math.max(0.05, Number(req.sceneThreshold) || 0.3));
   const maxScene = Math.max(1, Math.min(12, Math.round(Number(req.maxSceneFrames) || 6)));
@@ -524,10 +833,25 @@ async function runVideo(req) {
   let sceneCount = 0;
   try {
     fs.mkdirSync(sceneDir, { recursive: true });
+    // Build a select expression excluding global-motion intervals.
+    const inScroll = function (t) {
+      return scroll.some(function (s) { return t >= s.start - 0.1 && t <= s.end + 0.1; });
+    };
+    // fps=1 candidate timestamps at second granularity (scene filter
+    // evaluates per frame; this bounds the select checks).
+    let selectExpr = "select='gt(scene," + sceneThreshold + ")";
+    for (let sec = 0; sec <= Math.ceil(duration); sec += 1) {
+      if (inScroll(sec + 0.5)) selectExpr += "*not(between(t," + sec + "," + (sec + 1) + "))";
+    }
+    selectExpr += "'";
     await runTool(ffmpeg, ['-y', '-i', videoPath, '-vf',
-      "select='gt(scene," + sceneThreshold + ")'" + (tsFilter ? ',' + tsFilter : '') + ',scale=' + sceneWidth + ':-2',
-      '-fps_mode', 'vfr', '-frames:v', String(maxScene), '-q:v', '5', path.join(sceneDir, 'scene_%02d.jpg')], 180000);
+      selectExpr + (tsFilter ? ',' + tsFilter : '') + ',scale=' + sceneWidth + ':-2',
+      '-fps_mode', 'vfr', '-q:v', '5', path.join(sceneDir, 'scene_%02d.jpg')], 180000);
     const names = fs.readdirSync(sceneDir).filter(function (n) { return /^scene_\d+\.jpg$/.test(n); }).sort();
+    if (names.length > maxScene) {
+      for (let i = maxScene; i < names.length; i += 1) { try { fs.unlinkSync(path.join(sceneDir, names[i])); } catch (e) {} }
+      names.length = maxScene;
+    }
     sceneCount = names.length;
   } catch (e) { sceneCount = 0; }
 
@@ -554,6 +878,7 @@ async function runVideo(req) {
     detailSegments: segments.length, detailPeaks: peaks.length, detailFrames: detailFiles.length,
     segments: segments.map(function (s) { return { start: Number(s.start.toFixed(2)), end: Number(s.end.toFixed(2)) }; }),
     peaks: peaks.map(function (p) { return Number(p.t.toFixed(2)); }),
+    evidence: { scroll: scroll, events: events },
     frames: frames,
   };
 }
