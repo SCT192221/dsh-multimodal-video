@@ -747,10 +747,11 @@ export function apply(ctx) {
       '多模态能力（所有会话模式可用）：',
       '- 识图/OCR/图片问答使用 vision。省略 images 时，它会自动读取本会话最近一次粘贴或发送的图片（跨轮次可读）。',
       '- 生图/改图使用 generate_image。省略 references 时，它会自动使用本会话最近一次粘贴/发送的图片作为参考；没有图片时执行文生图。',
-      '- 在原生/标准工具模式中可直接调用这两个工具。若当前只有 run_code 可直接调用（Code Mode），必须在 run_code 程序内使用 await tools.vision({...}) 或 await tools.generate_image({...})；不要直接发起 vision/generate_image 工具调用。',
+      '- 在原生/标准工具模式中可直接调用这些工具。若当前只有 run_code 可直接调用（Code Mode），必须在 run_code 程序内使用 await tools.vision({...}) / await tools.generate_image({...}) / await tools.analyze_video({...})；不要直接发起 vision/generate_image/analyze_video 工具调用。',
       '- 一次成功调用后直接使用结果，不要反复识别、重试或额外验收。',
       '- generate_image 结果里 images 为内联展示的图片；若某张超过 harness 附件限制，会自动缩放为预览（名称带 -preview）内联展示，原图路径在 files 列表。出现预览或 files 都说明生成已成功、文件已保存，把路径告知用户即可，不要重试生成。',
       '- 脚本生成图表、截图等本地图片文件，用 show_image(path) 把图片直接展示在对话输出里（多张用 paths 列表一次展示）；不要只描述文件路径。',
+      '- 理解本地视频文件用 analyze_video(path)：它自动提取时序接触图、帧差分运动图与场景关键帧，一次性做跨帧时序分析——能看懂运动规律、镜头切换与特效演变过程，远胜逐帧静态识图。需要本机安装 ffmpeg。不要用 vision 逐帧分析视频。',
     ].join('\n'),
   }))
 
@@ -1013,5 +1014,124 @@ export function apply(ctx) {
         images.push(image)
       }
       return { images, paths: unique }
+    },
+  }))
+
+  // analyze_video: understand a local video file in ONE vision call by
+  // sending an "augmented frame pack" instead of raw frames. The helper
+  // (ffmpeg) builds three spatial encodings of the temporal axis:
+  //   - a timestamped contact sheet (uniform samples tiled into a grid,
+  //     row-major, time increasing) so the model sees the whole timeline
+  //     side by side and can read motion trajectories as position drift
+  //     across cells;
+  //   - a difference sheet (adjacent-sample frame deltas, brightness =
+  //     motion amplitude) so the model literally sees WHERE movement
+  //     happens and how strong it is;
+  //   - full stills at detected scene changes.
+  // Per-frame vision calls lose all inter-frame context; this pack keeps it.
+  ctx.effect(() => ctx.tools.register({
+    name: 'analyze_video',
+    description: '分析本地视频文件：内容概述、动态过程（谁在动、方向/速度/节奏）、镜头运用与转场、特效演变原理。自动提取时序接触图、帧差分运动图与场景关键帧，一次性做跨帧时序分析。需要本机安装 ffmpeg。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '本地视频文件的绝对路径（mp4/mov/mkv/webm 等ffmpeg支持的格式）。' },
+        prompt: { type: 'string', description: '想了解什么。省略时完整描述内容与动态过程。' },
+        grid_frames: { type: 'integer', minimum: 4, maximum: 24, description: '接触图采样帧数，默认 16。视频很长或只需粗看时可调小，需要更细时序可调大。' },
+        scene_threshold: { type: 'number', minimum: 0.05, maximum: 0.9, description: '场景切换检测灵敏度，默认 0.3，越小越敏感。' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 8192, description: '最大输出 token，默认 4096。' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string' },
+          model: { type: 'string' },
+          duration: { type: 'number' },
+          width: { type: 'integer' },
+          height: { type: 'integer' },
+          fps: { type: 'number' },
+          frames_used: { type: 'integer' },
+          scene_frames: { type: 'integer' },
+        },
+        required: ['content', 'model'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const blocks = [{ type: 'text', text: value?.content || '' }]
+        if (value && typeof value.duration === 'number') {
+          const dim = value.width && value.height ? `${value.width}×${value.height}@${Math.round(value.fps || 0)}fps` : '未知分辨率'
+          blocks.push({ type: 'text', text: `（视频 ${dim}，时长 ${value.duration.toFixed(1)}s，送检 ${value.frames_used} 张增强帧，其中场景关键帧 ${value.scene_frames} 张）` })
+        }
+        return blocks
+      },
+      // Text-only analysis output; no images to deliver, so keep it out of
+      // the turn-tail gallery (the frames are intermediate work).
+      presentationMeta: () => ({ images: [], final: false }),
+    },
+    timeoutMs: 600000,
+    async execute(args, exec) {
+      const config = loadConfig()
+      if (!config.visionEnabled) throw new Error('视觉通道已停用，请前往“设置 → 多模态”启用')
+      requireChannelConfig('vision', config)
+      const apiKey = await resolveCredential('vision')
+      const source = String(args.path || '').trim()
+      if (!source) throw new Error('请提供视频文件的绝对路径')
+      const target = await ctx.fs.resolve(source)
+      const info = await ctx.fs.stat(target)
+      if (!info) throw new Error(`视频文件不存在: ${source}`)
+      // ffmpeg is required only by this tool; resolve it up front so the
+      // error names the fix instead of surfacing as a helper subprocess
+      // failure.
+      let ffmpegPath
+      try {
+        ffmpegPath = await ctx.subprocess.resolveExecutable('ffmpeg')
+      } catch {
+        throw new Error('未找到 ffmpeg。analyze_video 需要本机安装 ffmpeg（Windows: winget install Gyan.FFmpeg；macOS: brew install ffmpeg；Linux: 系统包管理器安装后重启终端）。安装后重启 dsh web 再试。其余多模态工具不受影响。')
+      }
+      let ffprobePath
+      try { ffprobePath = await ctx.subprocess.resolveExecutable('ffprobe') } catch { ffprobePath = undefined }
+      const videoPath = typeof ctx.fs.processPath === 'function' ? ctx.fs.processPath(target) : target
+      const probe = await runHelper({
+        kind: 'video',
+        videoPath,
+        ...(ffmpegPath ? { ffmpeg: ffmpegPath } : {}),
+        ...(ffprobePath ? { ffprobe: ffprobePath } : {}),
+        ...(args.grid_frames !== undefined ? { gridFrames: args.grid_frames } : {}),
+        ...(args.scene_threshold !== undefined ? { sceneThreshold: args.scene_threshold } : {}),
+      }, exec?.signal)
+      const images = probe.frames.map((frame) => ({ dataUrl: `data:${frame.mime};base64,${frame.base64}`, label: frame.label }))
+      const guide = [
+        '以下是同一个视频的增强帧包（按此说明解读）：',
+        '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。同一对象在相邻格中的位置漂移即其运动轨迹。',
+        '2) diff-sheet：同一采样序列的相邻帧差分图：越亮表示该处变化越大（运动区域），暗部为静止背景。用于判断“什么在动、动得多强、往哪个方向”。',
+        '3) scene 关键帧（如有）：场景切换瞬间的完整帧。',
+        '请基于这些帧完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。静态帧读不出的运动信息务必结合 diff-sheet 与网格帧间变化推断，不要臆造。',
+      ].join('\n')
+      const prompt = `${guide}\n\n用户的分析请求：${args.prompt || '请完整描述这个视频的内容与动态过程。'}`
+      const result = await runHelper({
+        kind: 'vision',
+        apiKey,
+        baseUrl: config.visionBaseUrl,
+        model: config.visionModel,
+        prompt,
+        images,
+        detail: 'high',
+        maxTokens: args.max_tokens || 4096,
+        timeoutMs: 300000,
+      }, exec?.signal)
+      return {
+        content: result.content,
+        model: result.model || config.visionModel,
+        duration: probe.duration,
+        width: probe.width,
+        height: probe.height,
+        fps: probe.fps,
+        frames_used: probe.frames.length,
+        scene_frames: probe.sceneCount,
+      }
     },
   }))}

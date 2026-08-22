@@ -1,6 +1,6 @@
 # dsh-multimodal-client
 
-DeepSeek Harness 的多模态 client 插件（`dsh-multimodal` host 插件的配套 UI），把工具产出的图片渲染成真正的图片，而不是一坨 JSON。
+DeepSeek Harness 的多模态 client 插件（`dsh-multimodal-video` host 插件的配套 UI），把工具产出的图片渲染成真正的图片，而不是一坨 JSON。
 
 ## 功能
 
@@ -10,14 +10,14 @@ DeepSeek Harness 的多模态 client 插件（`dsh-multimodal` host 插件的配
 
 ## 前置
 
-必须先安装 host 插件 [`dsh-multimodal`](../dsh-multimodal/)（提供 vision / generate_image / show_image 工具与 `/global-multimodal/*` 路由）。本 client 包只做渲染与设置 UI。
+必须先安装 host 插件 [`dsh-multimodal-video`](../dsh-multimodal-video/)（提供 vision / generate_image / analyze_video / show_image 工具与 `/global-multimodal/*` 路由）。本 client 包只做渲染与设置 UI（`analyze_video` 输出为文本，无需专门视图）。
 
 ## 安装
 
 ### 方式 A：dsh plugin add
 
 ```sh
-corepack pnpm dsh plugin --profile web add github:SCT192221/dsh-multimodal#path:/dsh-multimodal-client
+corepack pnpm dsh plugin --profile web add github:SCT192221/dsh-multimodal-video#path:/dsh-multimodal-client
 ```
 
 包内 `cordis.patch.yml`（`dsh.bundle.patch`）会让命令自动把它加入 `dsh.profile.bundles` 并挂载。
@@ -27,7 +27,7 @@ corepack pnpm dsh plugin --profile web add github:SCT192221/dsh-multimodal#path:
 在 `~/.dsh/profiles/web/package.json` 的 `dependencies` 加：
 
 ```json
-"dsh-multimodal-client": "github:SCT192221/dsh-multimodal#path:/dsh-multimodal-client"
+"dsh-multimodal-client": "github:SCT192221/dsh-multimodal-video#path:/dsh-multimodal-client"
 ```
 
 在 `dsh.profile.bundles` 数组加 `"dsh-multimodal-client"`，然后在 profile 目录跑 `corepack pnpm install`，重启 `dsh web`。
