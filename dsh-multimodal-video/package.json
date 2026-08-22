@@ -1,7 +1,7 @@
 {
   "name": "dsh-multimodal-video",
-  "version": "0.3.0",
-  "description": "DeepSeek Harness host plugin: vision (image recognition/OCR/QA) + generate_image (text-to-image and reference-image editing with aspect-ratio matching) + show_image (inline local image display) + analyze_video (temporal video understanding via ffmpeg-extracted contact sheets, difference sheets and scene keyframes), plus text-only-model image-strip adaptation at the llm/stream boundary, plus auto-downscaled previews for images exceeding the harness attachment admission limits.",
+  "version": "0.4.0",
+  "description": "DeepSeek Harness host plugin: vision (image recognition/OCR/QA) + generate_image (text-to-image and reference-image editing with aspect-ratio matching) + show_image (inline local image display) + analyze_video (temporal video understanding via ffmpeg-extracted contact sheets, difference sheets, motion-guided high-resolution detail frames and scene keyframes), plus text-only-model image-strip adaptation at the llm/stream boundary, plus auto-downscaled previews for images exceeding the harness attachment admission limits.",
   "type": "module",
   "main": "index.mjs",
   "files": ["index.mjs", "multimodal-helper.cjs"],

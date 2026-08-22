@@ -751,7 +751,7 @@ export function apply(ctx) {
       '- 一次成功调用后直接使用结果，不要反复识别、重试或额外验收。',
       '- generate_image 结果里 images 为内联展示的图片；若某张超过 harness 附件限制，会自动缩放为预览（名称带 -preview）内联展示，原图路径在 files 列表。出现预览或 files 都说明生成已成功、文件已保存，把路径告知用户即可，不要重试生成。',
       '- 脚本生成图表、截图等本地图片文件，用 show_image(path) 把图片直接展示在对话输出里（多张用 paths 列表一次展示）；不要只描述文件路径。',
-      '- 理解本地视频文件用 analyze_video(path)：它自动提取时序接触图、帧差分运动图与场景关键帧，一次性做跨帧时序分析——能看懂运动规律、镜头切换与特效演变过程，远胜逐帧静态识图。需要本机安装 ffmpeg。不要用 vision 逐帧分析视频。',
+      '- 理解本地视频文件用 analyze_video(path)：它自动提取时序接触图、帧差分运动图、运动密集区高清放大帧与场景关键帧，一次性做跨帧时序分析——能看懂运动规律、镜头切换与特效演变过程（含精确时长与缓动特征），远胜逐帧静态识图。需要本机安装 ffmpeg。不要用 vision 逐帧分析视频。',
     ].join('\n'),
   }))
 
@@ -1019,7 +1019,7 @@ export function apply(ctx) {
 
   // analyze_video: understand a local video file in ONE vision call by
   // sending an "augmented frame pack" instead of raw frames. The helper
-  // (ffmpeg) builds three spatial encodings of the temporal axis:
+  // (ffmpeg) builds these spatial encodings of the temporal axis:
   //   - a timestamped contact sheet (uniform samples tiled into a grid,
   //     row-major, time increasing) so the model sees the whole timeline
   //     side by side and can read motion trajectories as position drift
@@ -1027,17 +1027,24 @@ export function apply(ctx) {
   //   - a difference sheet (adjacent-sample frame deltas, brightness =
   //     motion amplitude) so the model literally sees WHERE movement
   //     happens and how strong it is;
+  //   - motion-guided detail frames: an activity scan (tiny grayscale
+  //     frames at 4fps, consecutive-frame deltas) locates the most dynamic
+  //     intervals, and each interval is re-sampled at full resolution with
+  //     precise per-frame timestamps — fast UI transitions and effect
+  //     bursts that uniform sampling misses entirely;
   //   - full stills at detected scene changes.
   // Per-frame vision calls lose all inter-frame context; this pack keeps it.
   ctx.effect(() => ctx.tools.register({
     name: 'analyze_video',
-    description: '分析本地视频文件：内容概述、动态过程（谁在动、方向/速度/节奏）、镜头运用与转场、特效演变原理。自动提取时序接触图、帧差分运动图与场景关键帧，一次性做跨帧时序分析。需要本机安装 ffmpeg。',
+    description: '分析本地视频文件：内容概述、动态过程（谁在动、方向/速度/节奏）、镜头运用与转场、特效演变原理（含精确时长与缓动特征，可用于复刻实现）。自动检测运动最剧烈的时间段并高密度提取高清帧。需要本机安装 ffmpeg。',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '本地视频文件的绝对路径（mp4/mov/mkv/webm 等ffmpeg支持的格式）。' },
         prompt: { type: 'string', description: '想了解什么。省略时完整描述内容与动态过程。' },
-        grid_frames: { type: 'integer', minimum: 4, maximum: 24, description: '接触图采样帧数，默认 16。视频很长或只需粗看时可调小，需要更细时序可调大。' },
+        grid_frames: { type: 'integer', minimum: 4, maximum: 24, description: '接触图采样帧数，默认 16（超过30秒的视频自动升到24）。' },
+        detail_segments: { type: 'integer', minimum: 0, maximum: 8, description: '运动密集区放大片段数量，默认 4：自动检测变化最剧烈的时间段，每段高密度提取高清帧（默认每段4帧）。设 0 禁用。需要复刻特效细节时保持默认或调大。' },
+        detail_frames: { type: 'integer', minimum: 2, maximum: 8, description: '每个运动密集片段提取的高清帧数，默认 4。' },
         scene_threshold: { type: 'number', minimum: 0.05, maximum: 0.9, description: '场景切换检测灵敏度，默认 0.3，越小越敏感。' },
         max_tokens: { type: 'integer', minimum: 1, maximum: 8192, description: '最大输出 token，默认 4096。' },
       },
@@ -1056,6 +1063,8 @@ export function apply(ctx) {
           fps: { type: 'number' },
           frames_used: { type: 'integer' },
           scene_frames: { type: 'integer' },
+          detail_segments: { type: 'integer' },
+          detail_frames: { type: 'integer' },
         },
         required: ['content', 'model'],
         additionalProperties: false,
@@ -1064,7 +1073,8 @@ export function apply(ctx) {
         const blocks = [{ type: 'text', text: value?.content || '' }]
         if (value && typeof value.duration === 'number') {
           const dim = value.width && value.height ? `${value.width}×${value.height}@${Math.round(value.fps || 0)}fps` : '未知分辨率'
-          blocks.push({ type: 'text', text: `（视频 ${dim}，时长 ${value.duration.toFixed(1)}s，送检 ${value.frames_used} 张增强帧，其中场景关键帧 ${value.scene_frames} 张）` })
+          const detail = value.detail_segments ? `、运动密集区 ${value.detail_segments} 段高清放大帧 ${value.detail_frames || 0} 张` : ''
+          blocks.push({ type: 'text', text: `（视频 ${dim}，时长 ${value.duration.toFixed(1)}s，送检 ${value.frames_used} 张增强帧，其中场景关键帧 ${value.scene_frames} 张${detail}）` })
         }
         return blocks
       },
@@ -1101,15 +1111,19 @@ export function apply(ctx) {
         ...(ffmpegPath ? { ffmpeg: ffmpegPath } : {}),
         ...(ffprobePath ? { ffprobe: ffprobePath } : {}),
         ...(args.grid_frames !== undefined ? { gridFrames: args.grid_frames } : {}),
+        ...(args.detail_segments !== undefined ? { detailSegments: args.detail_segments } : {}),
+        ...(args.detail_frames !== undefined ? { detailFrames: args.detail_frames } : {}),
         ...(args.scene_threshold !== undefined ? { sceneThreshold: args.scene_threshold } : {}),
       }, exec?.signal)
       const images = probe.frames.map((frame) => ({ dataUrl: `data:${frame.mime};base64,${frame.base64}`, label: frame.label }))
       const guide = [
         '以下是同一个视频的增强帧包（按此说明解读）：',
-        '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。同一对象在相邻格中的位置漂移即其运动轨迹。',
+        '1) contact-sheet：均匀采样网格拼图，按行优先从左到右、从上到下时间递增，覆盖全片；每格左上角黄字为该帧时间戳。同一对象在相邻格中的位置漂移即其运动轨迹。用于把握整体结构与时间线。',
         '2) diff-sheet：同一采样序列的相邻帧差分图：越亮表示该处变化越大（运动区域），暗部为静止背景。用于判断“什么在动、动得多强、往哪个方向”。',
-        '3) scene 关键帧（如有）：场景切换瞬间的完整帧。',
-        '请基于这些帧完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。静态帧读不出的运动信息务必结合 diff-sheet 与网格帧间变化推断，不要臆造。',
+        '3) detail 高清帧（如有，重点）：系统自动检测了视频中运动/变化最剧烈的时间段，并在每段内高密度提取了全分辨率帧；左上角黄字 t= 为该帧精确时间戳，seg 为片段编号、f 为段内帧序。相邻两帧的时间戳差 = 该效果的真实演变时长；帧间的内容差异 = 效果的逐步变化过程。细读文字、颜色、布局请以这些帧为准。',
+        '4) scene 关键帧（如有）：场景切换瞬间的完整帧。',
+        '请基于这些帧完成用户的分析请求，按以下结构回答：先概述视频内容；再描述动态过程（什么对象在动、方向/速度/节奏如何演变）；然后说明镜头运用与转场（如有）；最后分析特效演变原理（如有：粒子/光效从哪里产生、如何扩散与消散）。',
+        '若用户要求复刻/实现/还原视频中的效果或界面：必须量化——用 detail 帧的时间戳差给出每个效果的持续时长（如 0.4s）；从相邻 detail 帧中对象的位置/尺寸/透明度变化推断运动方向与缓动类型（匀速、先快后慢=ease-out、先慢后快=ease-in、两端减速=ease-in-out）；精确描述颜色（说出近似色值）、布局位置（相对画面比例）与层次结构。静态帧读不出的运动信息务必结合 diff-sheet 与 detail 帧间变化推断，不要臆造。',
       ].join('\n')
       const prompt = `${guide}\n\n用户的分析请求：${args.prompt || '请完整描述这个视频的内容与动态过程。'}`
       const result = await runHelper({
@@ -1132,6 +1146,8 @@ export function apply(ctx) {
         fps: probe.fps,
         frames_used: probe.frames.length,
         scene_frames: probe.sceneCount,
+        detail_segments: probe.detailSegments || 0,
+        detail_frames: probe.detailFrames || 0,
       }
     },
   }))}

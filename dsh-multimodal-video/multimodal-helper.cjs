@@ -204,7 +204,7 @@ function probeFontFile() {
 
 function runTool(cmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024, encoding: 'buffer' }, (err, stdout, stderr) => {
       if (err) {
         if (err.code === 'ENOENT') reject(new Error('找不到可执行文件: ' + cmd));
         else reject(new Error(cmd + ' 退出码 ' + (err.code === undefined ? '?' : err.code) + ': ' + String(stderr || err.message || '').slice(0, 600)));
@@ -256,6 +256,70 @@ async function probeVideo(ffmpeg, ffprobe, videoPath) {
   return { duration: 0, width: 0, height: 0, fps: 0 };
 }
 
+// Motion-energy scan: decode tiny grayscale frames at a fixed scan rate and
+// measure the mean absolute difference between consecutive scan frames.
+// The resulting activity signal tells us WHEN the video actually changes —
+// uniform sampling cannot, which is exactly how fast UI transitions and
+// effect bursts fall between sample points. Capped at 15 minutes of scan
+// so rawvideo output stays within the exec buffer.
+async function scanMotion(ffmpeg, videoPath, duration) {
+  const scanFps = 4, w = 64, h = 36, frameBytes = w * h;
+  const capSeconds = Math.min(duration || 900, 900);
+  try {
+    const out = await runTool(ffmpeg, ['-t', String(capSeconds), '-i', videoPath, '-vf', 'fps=' + scanFps + ',scale=' + w + ':' + h + ',format=gray', '-f', 'rawvideo', '-'], 120000);
+    const buf = Buffer.from(out.stdout);
+    const n = Math.floor(buf.length / frameBytes);
+    if (n < 4) return [];
+    const energies = [];
+    for (let i = 1; i < n; i += 1) {
+      const a = buf.subarray((i - 1) * frameBytes, i * frameBytes);
+      const b = buf.subarray(i * frameBytes, (i + 1) * frameBytes);
+      let sum = 0;
+      for (let j = 0; j < frameBytes; j += 1) sum += Math.abs(b[j] - a[j]);
+      energies.push({ t: (i + 0.5) / scanFps, e: sum / frameBytes });
+    }
+    return energies;
+  } catch (e) { return []; }
+}
+
+// Turn the activity signal into at most `maxSegments` time ranges: threshold
+// at 2.5x the median energy, group contiguous active samples (1-sample gaps
+// tolerated), pad each run, keep the highest-scoring runs, merge overlaps,
+// and return them in chronological order.
+function motionSegments(energies, duration, maxSegments) {
+  if (!energies.length || maxSegments <= 0) return [];
+  const sorted = energies.map((x) => x.e).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const threshold = Math.max(median * 2.5, 2);
+  const runs = [];
+  let cur = null;
+  for (let i = 0; i < energies.length; i += 1) {
+    if (energies[i].e > threshold) {
+      if (!cur) { cur = { from: i, to: i, score: 0 }; runs.push(cur); }
+      cur.to = i;
+      cur.score += energies[i].e;
+    } else if (cur && i - cur.to >= 2) {
+      cur = null;
+    }
+  }
+  const pad = 0.4;
+  const segs = runs
+    .map((r) => ({ start: Math.max(0, energies[r.from].t - pad), end: Math.min(duration, energies[r.to].t + pad), score: r.score }))
+    .filter((s) => s.end - s.start >= 0.2);
+  segs.sort((a, b) => b.score - a.score);
+  const picked = segs.slice(0, maxSegments);
+  picked.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const s of picked) {
+    const last = merged[merged.length - 1];
+    if (last && s.start <= last.end + 0.05) {
+      last.end = Math.max(last.end, s.end);
+      last.score += s.score;
+    } else merged.push({ start: s.start, end: s.end, score: s.score });
+  }
+  return merged;
+}
+
 async function runVideo(req) {
   const ffmpeg = req.ffmpeg || 'ffmpeg';
   const ffprobe = req.ffprobe || 'ffprobe';
@@ -272,10 +336,13 @@ async function runVideo(req) {
   if (!(duration > 0)) duration = 10;
   if (!(fps > 0)) fps = 25;
 
-  const gridFrames = Math.max(4, Math.min(24, Math.round(Number(req.gridFrames) || 16)));
+  const rawGrid = Number(req.gridFrames);
+  const gridFrames = Math.max(4, Math.min(24, Math.round(
+    Number.isFinite(rawGrid) && rawGrid > 0 ? rawGrid : (duration > 30 ? 24 : 16)
+  )));
   const cols = Math.min(gridFrames, Math.ceil(Math.sqrt(gridFrames)));
   const rows = Math.ceil(gridFrames / cols);
-  const cell = Math.max(120, Math.min(720, Math.round(Number(req.gridCell) || 480)));
+  const cell = Math.max(120, Math.min(720, Math.round(Number(req.gridCell) || 640)));
   const font = req.fontFile || probeFontFile();
   // Slight oversampling so the tile filter reliably fills its last cell near
   // the video's end (the grid takes only the first cols*rows frames).
@@ -295,13 +362,50 @@ async function runVideo(req) {
     '-frames:v', '1', '-q:v', '4', gridPath], 180000);
 
   // 3. Diff sheet: same sampling, adjacent-frame difference with contrast
-  // boost — brightness encodes motion amplitude.
+  // boost — brightness encodes motion amplitude. Higher contrast so subtle
+  // UI fades (small per-pixel deltas) stay visible.
   const diffPath = path.join(outDir, 'diff_sheet.jpg');
   await runTool(ffmpeg, ['-y', '-i', videoPath, '-vf',
-    'fps=' + rate + ',tblend=all_mode=difference,eq=contrast=2.5' + (tsFilter ? ',' + tsFilter : '') + ',scale=' + cell + ':-2,tile=' + cols + 'x' + rows,
+    'fps=' + rate + ',tblend=all_mode=difference,eq=contrast=3.5' + (tsFilter ? ',' + tsFilter : '') + ',scale=' + cell + ':-2,tile=' + cols + 'x' + rows,
     '-frames:v', '1', '-q:v', '4', diffPath], 180000);
 
-  // 4. Scene-change frames at full-ish resolution. A single-shot video
+  // 4. Motion-guided detail pass — the resolution carrier for effects and
+  // fine detail. Uniform sampling at 16 frames over a minute cannot see a
+  // 300ms transition at all; these frames can. Scan the activity signal,
+  // pick the most dynamic intervals, and pull high-resolution frames from
+  // inside each so the model watches every effect actually unfold.
+  const detailSegmentsMax = Math.max(0, Math.min(8, Math.round(Number(req.detailSegments === undefined ? 4 : req.detailSegments))));
+  const detailFramesPerSeg = Math.max(2, Math.min(8, Math.round(Number(req.detailFrames) || 4)));
+  const detailWidth = Math.max(320, Math.min(1920, Math.round(Number(req.detailWidth) || 1280)));
+  const segments = [];
+  if (detailSegmentsMax > 0 && duration >= 2) {
+    segments.push(...motionSegments(await scanMotion(ffmpeg, videoPath, duration), duration, detailSegmentsMax));
+  }
+  const detailFiles = [];
+  for (let s = 0; s < segments.length; s += 1) {
+    const seg = segments[s];
+    const stamps = [];
+    for (let k = 0; k < detailFramesPerSeg; k += 1) {
+      const frac = detailFramesPerSeg === 1 ? 0.5 : k / (detailFramesPerSeg - 1);
+      stamps.push(seg.start + (seg.end - seg.start) * frac);
+    }
+    for (let k = 0; k < stamps.length; k += 1) {
+      const t = Math.max(0, Math.min(stamps[k], Math.max(0, duration - 0.05)));
+      const file = path.join(outDir, 'detail_s' + (s + 1) + '_f' + (k + 1) + '.jpg');
+      const stampText = 't=' + t.toFixed(2) + 's seg' + (s + 1) + '/' + segments.length + ' f' + (k + 1) + '/' + stamps.length;
+      const stamp = font
+        ? "drawtext=fontfile='" + ffPath(font) + "':text='" + stampText + "':x=8:y=8:fontsize=" + Math.max(22, Math.round(detailWidth / 40)) + ":fontcolor=yellow:box=1:boxcolor=black@0.6"
+        : '';
+      try {
+        await runTool(ffmpeg, ['-y', '-ss', t.toFixed(3), '-i', videoPath, '-frames:v', '1',
+          '-vf', 'scale=min(iw\\,' + detailWidth + '):-2' + (stamp ? ',' + stamp : ''),
+          '-q:v', '4', file], 60000);
+        detailFiles.push({ file: file, label: 'detail 片段 ' + (s + 1) + '/' + segments.length + '（' + seg.start.toFixed(2) + 's–' + seg.end.toFixed(2) + 's 自动检测的运动密集区）第 ' + (k + 1) + '/' + stamps.length + ' 帧 t=' + t.toFixed(2) + 's 高清帧' });
+      } catch (e) {}
+    }
+  }
+
+  // 5. Scene-change frames at full-ish resolution. A single-shot video
   // legitimately yields zero of these — never fatal.
   const sceneDir = path.join(outDir, 'scenes');
   const sceneThreshold = Math.min(0.9, Math.max(0.05, Number(req.sceneThreshold) || 0.3));
@@ -317,7 +421,8 @@ async function runVideo(req) {
     sceneCount = names.length;
   } catch (e) { sceneCount = 0; }
 
-  // 5. Assemble the pack.
+  // 6. Assemble the pack: overview first, then motion map, then the
+  // high-resolution detail sequences, then scene keyframes.
   const frames = [];
   const push = function (file, label) {
     try {
@@ -327,12 +432,19 @@ async function runVideo(req) {
   };
   push(gridPath, 'contact-sheet ' + cols + 'x' + rows + ' 网格拼图（行优先、时间递增，均匀覆盖全片，每格左上角为该帧时间戳）');
   push(diffPath, 'diff-sheet 相邻采样帧差分图（越亮=该处运动/变化越大，暗部为静止背景）');
+  for (let i = 0; i < detailFiles.length; i += 1) push(detailFiles[i].file, detailFiles[i].label);
   if (sceneCount > 0) {
     const names = fs.readdirSync(sceneDir).filter(function (n) { return /^scene_\d+\.jpg$/.test(n); }).sort();
     for (let i = 0; i < names.length; i += 1) push(path.join(sceneDir, names[i]), 'scene ' + (i + 1) + '/' + sceneCount + '（场景切换关键帧，左上角为时间戳）');
   }
   if (!frames.length) throw new Error('ffmpeg 未产出任何帧（视频可能损坏或编码不受支持）');
-  return { duration: duration, width: width, height: height, fps: fps, gridFrames: gridFrames, sceneCount: sceneCount, frames: frames };
+  return {
+    duration: duration, width: width, height: height, fps: fps,
+    gridFrames: gridFrames, sceneCount: sceneCount,
+    detailSegments: segments.length, detailFrames: detailFiles.length,
+    segments: segments.map(function (s) { return { start: Number(s.start.toFixed(2)), end: Number(s.end.toFixed(2)) }; }),
+    frames: frames,
+  };
 }
 
 async function main() {

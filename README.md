@@ -6,7 +6,7 @@
 
 | 包 | 类型 | 作用 |
 |------|------|------|
-| `dsh-multimodal-video` | host 插件 | vision 识图 + generate_image 生图/改图（含参考图比例匹配、超限自动缩放预览）+ **analyze_video 视频时序分析**（接触图/差分图/场景帧增强帧包）+ show_image 展示（支持多张）+ 纯文本模型 image-strip 适配 + `/global-multimodal/*` 配置路由 |
+| `dsh-multimodal-video` | host 插件 | vision 识图 + generate_image 生图/改图（含参考图比例匹配、超限自动缩放预览）+ **analyze_video 视频时序分析**（接触图/差分图/运动密集区高清放大帧/场景帧增强帧包）+ show_image 展示（支持多张）+ 纯文本模型 image-strip 适配 + `/global-multimodal/*` 配置路由 |
 | `dsh-multimodal-client` | client 插件 | 工具卡内联图 + turn-tail 图集 + 「设置 → 多模态」设置页（模型/端点/API Key/连接测试） |
 
 > 只装 host 也能用：工具全部可用，图片以通用卡片显示、配置走手编文件；装上 client 才有图片渲染和设置页。
@@ -92,9 +92,10 @@ sudo apt install ffmpeg
 
 - **contact-sheet**：N 帧均匀采样拼网格（时间递增 + 时间戳水印）→ 模型横读运动轨迹与演变节奏
 - **diff-sheet**：相邻采样帧差分（亮度 = 运动幅度）→ 模型直读「什么在动、动得多强、往哪动」
+- **detail 高清放大帧**（复刻关键）：自动扫描运动能量曲线定位变化最剧烈的时间段，每段高密度提取全分辨率帧（带精确时间戳）→ 模型读出每个动效的精确时长、缓动特征与视觉细节，足以直接写 CSS 动画
 - **scene 关键帧**：场景切换瞬间完整帧 → 转场与镜头切换一目了然
 
-三组图随结构化引导提示一次送视觉模型，输出固定结构：内容概述 → 动态过程 → 镜头运用与转场 → 特效演变原理。用法见 `dsh-multimodal-video/README.md` 的「视频理解增强」章节。
+四组图随结构化引导提示一次送视觉模型，输出固定结构：内容概述 → 动态过程 → 镜头运用与转场 → 特效演变原理；复刻请求时强制量化输出时长/缓动/色值/布局。用法见 `dsh-multimodal-video/README.md` 的「视频理解增强」章节。
 
 ## 配置凭据
 
